@@ -264,7 +264,7 @@ git checkout -b feature/<slugified-description>
 - [ ] Error handling correct
 - [ ] Events published
 
-### Phase 6: Deliver
+### Phase 6: Deliver (Commit, Push, Open PR)
 
 ```bash
 git add <files>
@@ -272,28 +272,58 @@ git commit -m "feat(<ticket-or-scope>): <description>"
 git push -u origin <branch-name>
 ```
 
-Generate summary in English with bullets:
-- Branch name
-- What was done
-- How to test
+Then create the PR and **capture the PR number** from the output:
 
-Create PR using `gh pr create`.
+```bash
+PR_URL=$(gh pr create --title "..." --body "$(cat <<'EOF'
+## Summary
+- <bullet 1>
+- <bullet 2>
 
-### Phase 7: Schedule PR Review Check
+## Test plan
+- [ ] <step 1>
+EOF
+)")
+PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+```
 
-After the PR is created, schedule a check after 10 minutes to verify if there are any review comments:
+Record both `$PR_URL` and `$PR_NUMBER` — they are required inputs for Phase 7.
 
-1. Use `/loop 10m` or `CronCreate` to schedule a single check
-2. The check should:
-   - Fetch PR review comments using `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments`
-   - Fetch PR reviews using `gh pr view {pr_number} --json reviews`
-   - If there are unresolved comments or CHANGES_REQUESTED, notify the user
-   - If no comments, report that the PR is clear
-3. Use the `/review-resolver` skill if actionable comments are found, presenting them to the user for resolution
+### Phase 7: PR Review Wait + Resolver Hand-off
+
+This phase is **mandatory** after every `gh pr create`. The goal is to give human + automated reviewers a 10-minute window to leave feedback, then either escalate to `/review-resolver` or declare the PR clean.
+
+1. **Schedule the check 10 minutes out** using `ScheduleWakeup` (do not block-wait — the run yields and re-enters when the timer fires):
+   ```
+   ScheduleWakeup({
+     delaySeconds: 600,
+     reason: "10-min review window for PR <PR_NUMBER>",
+     prompt: "/maverick:resume-review <PR_NUMBER>"   # or inline the resume steps below
+   })
+   ```
+   If `ScheduleWakeup` is unavailable in the current harness, fall back to `/loop 10m` once with the same payload.
+
+2. **When the timer fires, gather PR feedback**:
+   ```bash
+   gh pr view $PR_NUMBER --json state,reviews,reviewDecision,statusCheckRollup
+   gh api repos/:owner/:repo/pulls/$PR_NUMBER/comments --paginate
+   gh api repos/:owner/:repo/issues/$PR_NUMBER/comments --paginate
+   ```
+   Treat **all three** sources as inputs — inline-thread comments, top-level PR comments, and formal reviews all carry actionable items.
+
+3. **Decide the next step** by classifying the gathered feedback:
+   - `reviewDecision == "CHANGES_REQUESTED"` **OR** any unresolved review thread **OR** any comment requesting changes
+     → invoke `/review-resolver $PR_NUMBER`. That skill is responsible for listing each actionable point, proposing a fix, and prompting for execution.
+   - Failing required status checks → invoke `/review-resolver $PR_NUMBER` as well so the failure surfaces alongside human review comments.
+   - No actionable items and checks green → output `PR <PR_NUMBER> is clear after the 10-minute review window.` and end the maverick run.
+
+4. **Loop guard**: do not re-schedule Phase 7 from inside itself. After one resolver hand-off the user drives the next iteration. Maverick's job ends when the 10-min window has been honored once.
 
 ---
 
 ## Completion
+
+Emit completion **only after Phase 7's review window has been honored** (one scheduled check, then either a `/review-resolver` hand-off or a "clear" result).
 
 ### Single Ticket (Linear)
 ```
@@ -301,7 +331,8 @@ MAVERICK_COMPLETE
 
 Branch: feature/<ticket>
 Summary: <bullets>
-Status: Ready for PR
+PR: <PR_URL>
+Review: <"clear after 10-min window" | "handed off to /review-resolver">
 ```
 
 ### Multiple Tickets (Linear)
@@ -309,11 +340,9 @@ Status: Ready for PR
 MAVERICK_PARALLEL_COMPLETE
 
 Completed Tickets:
-- AP-552: feature/ap-552
-- AP-553: feature/ap-553
-- AP-554: feature/ap-554
-
-All branches pushed and ready for PR.
+- AP-552: feature/ap-552 | PR #<n> | <review status>
+- AP-553: feature/ap-553 | PR #<n> | <review status>
+- AP-554: feature/ap-554 | PR #<n> | <review status>
 ```
 
 ### Local Task
@@ -323,7 +352,8 @@ MAVERICK_COMPLETE
 Task: <description>
 Branch: feature/<branch-name>
 Summary: <bullets>
-Status: Ready for PR
+PR: <PR_URL>
+Review: <"clear after 10-min window" | "handed off to /review-resolver">
 ```
 
 ---
